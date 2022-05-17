@@ -60,6 +60,7 @@ phil=> select age, name from x;
 ## References
 
 * [Philip O'Toole on rqlite](https://youtu.be/rqO9PtBkiSQ?t=2332)
+* http://code.openark.org/blog/mysql/observations-on-the-hashicorpraft-library-and-notes-on-rdbms
 * https://github.com/eatonphil/raft-example
 * https://yusufs.medium.com/creating-distributed-kv-database-by-implementing-raft-consensus-using-golang-d0884eef2e28
 * https://github.com/Jille/raft-grpc-example
