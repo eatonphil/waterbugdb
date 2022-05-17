@@ -237,15 +237,13 @@ func (pe *pgEngine) delete() error {
 }
 
 type pgFsm struct {
-	pe      *pgEngine
-	queries []string
+	pe *pgEngine
 }
 
 func (pf *pgFsm) Apply(log *raft.Log) any {
 	switch log.Type {
 	case raft.LogCommand:
 		query := string(log.Data)
-		pf.queries = append(pf.queries, query)
 		ast, err := pgquery.Parse(query)
 		if err != nil {
 			panic(fmt.Errorf("Could not parse payload: %s", err))
@@ -572,7 +570,7 @@ func main() {
 	pe := newPgEngine(db)
 	// Start off in clean state
 	pe.delete()
-	pf := &pgFsm{pe, nil}
+	pf := &pgFsm{pe}
 
 	r, err := setupRaft(path.Join(dataDir, "raft"+cfg.id), cfg.id, "localhost:"+cfg.raftPort, pf)
 	if err != nil {
