@@ -2,7 +2,7 @@ package main
 
 import (
 	"encoding/json"
-	"strings"
+	"bytes"
 	"fmt"
 	"io"
 	"log"
@@ -12,15 +12,16 @@ import (
 	"path"
 	"time"
 
+	"github.com/jackc/pgproto3/v2"
 	pgquery "github.com/pganalyze/pg_query_go/v2"
-	"github.com/cockroachdb/pebble"
+	bolt "go.etcd.io/bbolt"
 	"github.com/hashicorp/raft"
 	"github.com/google/uuid"
 	"github.com/hashicorp/raft-boltdb"
 )
 
 type pgEngine struct {
-	db *pebble.DB
+	db *bolt.DB
 }
 
 type pgResult struct {
@@ -60,7 +61,10 @@ func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) (*pgResult, error){
 		return nil, fmt.Errorf("Could not marshal table: %s", err)
 	}
 
-	err = pe.db.Set([]byte("tables_"+tbl.Name), tableBytes, pebble.Sync)
+	err = pe.db.Update(func (tx *bolt.Tx) error {
+		return tx.Bucket([]byte("data")).Put([]byte("tables_"+tbl.Name), tableBytes)
+	})
+
 	if err != nil {
 		return nil, fmt.Errorf("Could not set key-value: %s", err)
 	}
@@ -69,19 +73,20 @@ func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) (*pgResult, error){
 }
 
 func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
-	valBytes, closer, err := pe.db.Get([]byte("tables_"+name))
-	if err != nil {
-		return nil, fmt.Errorf("Could not get table: %s", err)
-	}
-	defer closer.Close()
-
 	var tbl tableDefinition
-	err = json.Unmarshal(valBytes, &tbl)
-	if err != nil{
-		return nil, fmt.Errorf("Could not unmarshal table: %s", err)
-	}
 
-	return &tbl, nil
+	err := pe.db.View(func (tx *bolt.Tx) error {
+		valBytes := tx.Bucket([]byte("data")).Get([]byte("tables_"+name))
+		err := json.Unmarshal(valBytes, &tbl)
+		if err != nil{
+			return fmt.Errorf("Could not unmarshal table: %s", err)
+		}
+
+		return nil
+	})
+	
+
+	return &tbl, err
 }
 
 func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) (*pgResult, error){
@@ -112,7 +117,9 @@ func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) (*pgResult, error){
 		}
 
 		id := uuid.New().String()
-		err = pe.db.Set([]byte("rows_"+tblName + "_"+id), rowBytes, pebble.Sync)
+		err = pe.db.Update(func (tx *bolt.Tx)error {
+			return tx.Bucket([]byte("data")).Put([]byte("rows_"+tblName + "_"+id), rowBytes)
+		})
 		if err != nil {
 			return nil, fmt.Errorf("Could not store row: %s", err)
 		}
@@ -147,29 +154,16 @@ func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error){
 		results.fieldTypes = append(results.fieldTypes, fieldType)
 	}
 
-	rowPrefix := "rows_"+tblName+"_"
-	iter := db.NewIter(&pebble.IterOptions{
-		LowerBound: rowPrefix,
-	})
-	in := false
-	defer iter.Close()
+	prefix := []byte("rows_"+tblName+"_")
+	pe.db.View(func(tx *bolt.Tx) error {
+		// Assume bucket exists and has keys
+		c := tx.Bucket([]byte("MyBucket")).Cursor()
 
-	var results *pgResult
-	results.fieldNames = columns
-	results.fieldTables = tbl.ColumnTypes
-
-	for iter.First(); iter.Valid(); iter.Next() {
-		if strings.StartsWith(string(iter.Key()), rowPrefix) {
-			in = true
-		} else if in {
-			break
-		}
-
-		if in {
+		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
 			var row []any
-			err = json.Unmarshal(iter.Value())
+			err = json.Unmarshal(v, &row)
 			if err != nil {
-				return nil, fmt.Errorf("Unable to unmarshal row: %s", err)
+				return fmt.Errorf("Unable to unmarshal row: %s", err)
 			}
 
 			var targetRow []any
@@ -183,7 +177,9 @@ func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error){
 
 			results.rows = append(results.rows, targetRow)
 		}
-	}
+
+		return nil
+	})
 
 	return results, nil
 }
@@ -229,7 +225,7 @@ func (pf *pgFsm) Apply(log *raft.Log) any {
 			return fmt.Errorf("Could not parse payload: %s", err)
 		}
 
-		err := pe.execute(ast)
+		_, err = pf.pe.execute(ast)
 		if err != nil {
 			return err
 		}
@@ -256,15 +252,20 @@ func (pf *pgFsm) Restore(rc io.ReadCloser) error {
 	decoder := json.NewDecoder(rc)
 
 	for decoder.More() {
-		var sp setPayload
+		var sp string
 		err := decoder.Decode(&sp)
 		if err != nil {
 			return fmt.Errorf("Could not decode payload: %s", err)
 		}
 
-		err = pf.db.Set([]byte(sp.Key), []byte(sp.Value), pebble.Sync)
+		ast, err := pgquery.Parse(sp)
 		if err != nil {
-			return fmt.Errorf("Could not set")
+			return fmt.Errorf("Could not parse payload: %s", err)
+		}
+
+		_, err = pf.pe.execute(ast)
+		if err != nil {
+			return err
 		}
 	}
 
@@ -343,12 +344,12 @@ func (hs httpServer) joinHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-var dataTypeOIDMap = map[string]int{
+var dataTypeOIDMap = map[string]uint32{
 	"text": 25,
 	"pg_catalog.int4": 23,
 }
 
-func writePgResult(res* pgResult, pgconn *pgproto3.Backend) {
+func writePgResult(res* pgResult, conn net.Conn) {
 	rd := &pgproto3.RowDescription{}
 	for i, field := range res.fieldNames {
 		rd.Fields = append(rd.Fields, pgproto3.FieldDescription{
@@ -357,9 +358,9 @@ func writePgResult(res* pgResult, pgconn *pgproto3.Backend) {
 		})
 	}
 	buf := rd.Encode(nil)
-	for i, row := range res.rows {
+	for _, row := range res.rows {
 		dr := &pgproto3.DataRow{}
-		for i, value := range row {
+		for _, value := range row {
 			bs, err := json.Marshal(value)
 			if err != nil {
 				log.Printf("Failed to marshal cell: %s\n", err)
@@ -369,18 +370,18 @@ func writePgResult(res* pgResult, pgconn *pgproto3.Backend) {
 			dr.Values = append(dr.Values, bs)
 		}
 
-		buf = buf.Encode(buf)
+		buf = dr.Encode(buf)
 	}
 
 	buf = (&pgproto3.CommandComplete{CommandTag: []byte(fmt.Sprintf("SELECT %d", len(res.rows)))}).Encode(buf)
 	buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
-	_, err = pgconn.Write(buf)
+	_, err := conn.Write(buf)
 	if err != nil {
 		log.Printf("Failed to write query response: %s", err)
 	}
 }
 
-func runPgServer(port string, db *pebble.DB, r *raft.Raft) {
+func runPgServer(port string, db *bolt.DB, r *raft.Raft) {
 	ln, err := net.Listen("tcp", "localhost:" + port)
 	if err != nil {
 		log.Fatal(err)
@@ -411,12 +412,12 @@ func runPgServer(port string, db *pebble.DB, r *raft.Raft) {
 						return
 					}
 
-					if len(tree.GetStmts()) > 1 {
+					if len(stmts.GetStmts()) > 1 {
 						log.Println("Only make one request at a time.")
 						return
 					}
 
-					stmt := tree.GetStmts()[0]
+					stmt := stmts.GetStmts()[0]
 
 					// Handle SELECTs here
 					s := stmt.GetStmt().GetSelectStmt()
@@ -428,13 +429,12 @@ func runPgServer(port string, db *pebble.DB, r *raft.Raft) {
 							return
 						}
 
-						writePgResult(res, pgconn)
+						writePgResult(res, conn)
 						continue
 					}
 
 					// Otherwise it's DDL/DML, raftify
-					f := r.Apply(t.String)
-					future := hs.r.Apply(bs, 500*time.Millisecond)
+					future := r.Apply([]byte(t.String), 500*time.Millisecond)
 					if err := future.Error(); err != nil {
 						log.Printf("Could not apply: %s", err)
 						return
@@ -519,12 +519,14 @@ func main() {
 		log.Fatalf("Could not create data directory: %s", err)
 	}
 
-	db, err := pebble.Open(path.Join(dataDir, "/data"+cfg.id), &pebble.Options{})
+	db, err := bolt.Open(path.Join(dataDir, "/data"+cfg.id), 0600, nil)
 	if err != nil {
-		log.Fatalf("Could not open pebble db: %s", err)
+		log.Fatalf("Could not open bolt db: %s", err)
 	}
+	defer db.Close()
 
-	pf := &pgFsm{db}
+	pe := &pgEngine{db}
+	pf := &pgFsm{pe}
 
 	r, err := setupRaft(path.Join(dataDir, "raft"+cfg.id), cfg.id, "localhost:" + cfg.raftPort, pf)
 	if err != nil {
