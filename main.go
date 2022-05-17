@@ -396,9 +396,38 @@ func runPgServer(port string, db *bolt.DB, r *raft.Raft) {
 			defer conn.Close()
 
 			for {
+				startupMessage, err := pgconn.ReceiveStartupMessage()
+				if err != nil {
+					log.Printf("error receiving startup message: %s\n", err)
+					return
+				}
+
+				switch startupMessage.(type) {
+				case *pgproto3.StartupMessage:
+					buf := (&pgproto3.AuthenticationOk{}).Encode(nil)
+					buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+					_, err = conn.Write(buf)
+					if err != nil {
+						log.Printf("Error sending ready for query: %s\n", err)
+						return
+					}
+					break
+				case *pgproto3.SSLRequest:
+					_, err = conn.Write([]byte("N"))
+					if err != nil {
+						log.Printf("Error sending deny SSL request: %s\n", err)
+						return
+					}
+				default:
+					log.Printf("Unknown startup message: %#v\n", startupMessage)
+					return
+				}
+			}
+
+			for {
 				msg, err := pgconn.Receive()
 				if err != nil {
-					log.Println("Error receiving message: %w", err)
+					log.Printf("Error receiving message: %s\n", err)
 					return
 				}
 
@@ -406,7 +435,7 @@ func runPgServer(port string, db *bolt.DB, r *raft.Raft) {
 				case *pgproto3.Query:
 					stmts, err := pgquery.Parse(t.String)
 					if err != nil {
-						log.Println("Error parsing query: %w", err)
+						log.Printf("Error parsing query: %s\n", err)
 						return
 					}
 
@@ -446,7 +475,7 @@ func runPgServer(port string, db *bolt.DB, r *raft.Raft) {
 				case *pgproto3.Terminate:
 					return
 				default:
-					log.Println("Received message other than Query from client: %#v", msg)
+					log.Printf("Received message other than Query from client: %s\n", msg)
 					return
 				}
 			}
