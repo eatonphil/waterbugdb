@@ -62,7 +62,12 @@ func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) (*pgResult, error) {
 	}
 
 	err = pe.db.Update(func(tx *bolt.Tx) error {
-		return tx.Bucket([]byte("data")).Put([]byte("tables_"+tbl.Name), tableBytes)
+		bkt, err := tx.CreateBucketIfNotExists([]byte("data"))
+		if err != nil {
+			return err
+		}
+
+		return bkt.Put([]byte("tables_"+tbl.Name), tableBytes)
 	})
 
 	if err != nil {
@@ -76,8 +81,13 @@ func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
 	var tbl tableDefinition
 
 	err := pe.db.View(func(tx *bolt.Tx) error {
-		valBytes := tx.Bucket([]byte("data")).Get([]byte("tables_" + name))
-		err := json.Unmarshal(valBytes, &tbl)
+		bkt, err := tx.CreateBucketIfNotExists([]byte("data"))
+		if err != nil {
+			return err
+		}
+
+		valBytes := bkt.Get([]byte("tables_" + name))
+		err = json.Unmarshal(valBytes, &tbl)
 		if err != nil {
 			return fmt.Errorf("Could not unmarshal table: %s", err)
 		}
@@ -117,7 +127,12 @@ func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) (*pgResult, error) {
 
 		id := uuid.New().String()
 		err = pe.db.Update(func(tx *bolt.Tx) error {
-			return tx.Bucket([]byte("data")).Put([]byte("rows_"+tblName+"_"+id), rowBytes)
+			bkt, err := tx.CreateBucketIfNotExists([]byte("data"))
+			if err != nil {
+				return err
+			}
+
+			return bkt.Put([]byte("rows_"+tblName+"_"+id), rowBytes)
 		})
 		if err != nil {
 			return nil, fmt.Errorf("Could not store row: %s", err)
@@ -395,10 +410,11 @@ func runPgServer(port string, db *bolt.DB, r *raft.Raft) {
 			pgconn := pgproto3.NewBackend(pgproto3.NewChunkReader(conn), conn)
 			defer conn.Close()
 
+		startup:
 			for {
 				startupMessage, err := pgconn.ReceiveStartupMessage()
 				if err != nil {
-					log.Printf("error receiving startup message: %s\n", err)
+					log.Printf("Error receiving startup message: %s\n", err)
 					return
 				}
 
@@ -411,7 +427,7 @@ func runPgServer(port string, db *bolt.DB, r *raft.Raft) {
 						log.Printf("Error sending ready for query: %s\n", err)
 						return
 					}
-					break
+					break startup
 				case *pgproto3.SSLRequest:
 					_, err = conn.Write([]byte("N"))
 					if err != nil {
