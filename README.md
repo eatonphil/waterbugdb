@@ -17,7 +17,7 @@ $ ./waterbugdb --node-id node2 --raft-port 2223 --http-port 8223 --pg-port 6001
 Terminal 3, tell 1 to have 2 follow it:
 
 ```bash
-$ curl 'localhost:8222/join?followerAddr=localhost:2223&followerId=node2'
+$ curl 'localhost:8222/add-follower?addr=localhost:2223&id=node2'
 ```
 
 Terminal 3, now open psql:

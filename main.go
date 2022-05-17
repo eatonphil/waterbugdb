@@ -30,12 +30,6 @@ func newPgEngine(db *bolt.DB) *pgEngine {
 	return &pgEngine{db, []byte("data")}
 }
 
-type pgResult struct {
-	fieldNames []string
-	fieldTypes []string
-	rows       [][]any
-}
-
 type tableDefinition struct {
 	Name        string
 	ColumnNames []string
@@ -146,6 +140,12 @@ func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) error {
 	}
 
 	return nil
+}
+
+type pgResult struct {
+	fieldNames []string
+	fieldTypes []string
+	rows       [][]any
 }
 
 func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
@@ -325,9 +325,9 @@ type httpServer struct {
 	r *raft.Raft
 }
 
-func (hs httpServer) joinHandler(w http.ResponseWriter, r *http.Request) {
-	followerId := r.URL.Query().Get("followerId")
-	followerAddr := r.URL.Query().Get("followerAddr")
+func (hs httpServer) addFollowerHandler(w http.ResponseWriter, r *http.Request) {
+	followerId := r.URL.Query().Get("id")
+	followerAddr := r.URL.Query().Get("addr")
 
 	if hs.r.State() != raft.Leader {
 		json.NewEncoder(w).Encode(struct {
@@ -353,7 +353,22 @@ var dataTypeOIDMap = map[string]uint32{
 	"pg_catalog.int4": 23,
 }
 
-func writePgResult(res *pgResult, conn net.Conn) {
+type pgConn struct {
+	conn net.Conn
+	db   *bolt.DB
+	r    *raft.Raft
+}
+
+func (pc pgConn) done(buf []byte, msg string) {
+	buf = (&pgproto3.CommandComplete{CommandTag: []byte(msg)}).Encode(buf)
+	buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+	_, err := pc.conn.Write(buf)
+	if err != nil {
+		log.Printf("Failed to write query response: %s", err)
+	}
+}
+
+func (pc pgConn) writePgResult(res *pgResult) {
 	rd := &pgproto3.RowDescription{}
 	for i, field := range res.fieldNames {
 		rd.Fields = append(rd.Fields, pgproto3.FieldDescription{
@@ -377,11 +392,106 @@ func writePgResult(res *pgResult, conn net.Conn) {
 		buf = dr.Encode(buf)
 	}
 
-	buf = (&pgproto3.CommandComplete{CommandTag: []byte(fmt.Sprintf("SELECT %d", len(res.rows)))}).Encode(buf)
-	buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
-	_, err := conn.Write(buf)
+	pc.done(buf, fmt.Sprintf("SELECT %d", len(res.rows)))
+}
+
+func (pc pgConn) handleStartupMessage(pgconn *pgproto3.Backend) error {
+	startupMessage, err := pgconn.ReceiveStartupMessage()
 	if err != nil {
-		log.Printf("Failed to write query response: %s", err)
+		return fmt.Errorf("Error receiving startup message: %s", err)
+	}
+
+	switch startupMessage.(type) {
+	case *pgproto3.StartupMessage:
+		buf := (&pgproto3.AuthenticationOk{}).Encode(nil)
+		buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+		_, err = pc.conn.Write(buf)
+		if err != nil {
+			return fmt.Errorf("Error sending ready for query: %s", err)
+		}
+
+		return nil
+	case *pgproto3.SSLRequest:
+		_, err = pc.conn.Write([]byte("N"))
+		if err != nil {
+			return fmt.Errorf("Error sending deny SSL request: %s", err)
+		}
+
+		return pc.handleStartupMessage(pgconn)
+	default:
+		return fmt.Errorf("Unknown startup message: %#v", startupMessage)
+	}
+}
+
+func (pc pgConn) handleMessage(pgc *pgproto3.Backend) error {
+	msg, err := pgc.Receive()
+	if err != nil {
+		return fmt.Errorf("Error receiving message: %s", err)
+	}
+
+	switch t := msg.(type) {
+	case *pgproto3.Query:
+		stmts, err := pgquery.Parse(t.String)
+		if err != nil {
+			return fmt.Errorf("Error parsing query: %s", err)
+		}
+
+		if len(stmts.GetStmts()) > 1 {
+			return fmt.Errorf("Only make one request at a time.")
+		}
+
+		stmt := stmts.GetStmts()[0]
+
+		// Handle SELECTs here
+		s := stmt.GetStmt().GetSelectStmt()
+		if s != nil {
+			pe := newPgEngine(pc.db)
+			res, err := pe.executeSelect(s)
+			if err != nil {
+				return err
+			}
+
+			pc.writePgResult(res)
+			return nil
+		}
+
+		// Otherwise it's DDL/DML, raftify
+		future := pc.r.Apply([]byte(t.String), 500*time.Millisecond)
+		if err := future.Error(); err != nil {
+			return fmt.Errorf("Could not apply: %s", err)
+		}
+
+		e := future.Response()
+		if e != nil {
+			return fmt.Errorf("Could not apply (internal): %s", e)
+		}
+
+		pc.done(nil, strings.ToUpper(strings.Split(t.String, " ")[0])+" ok")
+	case *pgproto3.Terminate:
+		return nil
+	default:
+		return fmt.Errorf("Received message other than Query from client: %s", msg)
+	}
+
+	return nil
+}
+
+func (pc pgConn) handle() {
+	pgc := pgproto3.NewBackend(pgproto3.NewChunkReader(pc.conn), pc.conn)
+	defer pc.conn.Close()
+
+	err := pc.handleStartupMessage(pgc)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	for {
+		err := pc.handleMessage(pgc)
+		if err != nil {
+			log.Println(err)
+			return
+		}
 	}
 }
 
@@ -397,104 +507,8 @@ func runPgServer(port string, db *bolt.DB, r *raft.Raft) {
 			log.Fatal(err)
 		}
 
-		go func() {
-			pgconn := pgproto3.NewBackend(pgproto3.NewChunkReader(conn), conn)
-			defer conn.Close()
-
-		startup:
-			for {
-				startupMessage, err := pgconn.ReceiveStartupMessage()
-				if err != nil {
-					log.Printf("Error receiving startup message: %s\n", err)
-					return
-				}
-
-				switch startupMessage.(type) {
-				case *pgproto3.StartupMessage:
-					buf := (&pgproto3.AuthenticationOk{}).Encode(nil)
-					buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
-					_, err = conn.Write(buf)
-					if err != nil {
-						log.Printf("Error sending ready for query: %s\n", err)
-						return
-					}
-					break startup
-				case *pgproto3.SSLRequest:
-					_, err = conn.Write([]byte("N"))
-					if err != nil {
-						log.Printf("Error sending deny SSL request: %s\n", err)
-						return
-					}
-				default:
-					log.Printf("Unknown startup message: %#v\n", startupMessage)
-					return
-				}
-			}
-
-			for {
-				msg, err := pgconn.Receive()
-				if err != nil {
-					log.Printf("Error receiving message: %s\n", err)
-					return
-				}
-
-				switch t := msg.(type) {
-				case *pgproto3.Query:
-					stmts, err := pgquery.Parse(t.String)
-					if err != nil {
-						log.Printf("Error parsing query: %s\n", err)
-						return
-					}
-
-					if len(stmts.GetStmts()) > 1 {
-						log.Println("Only make one request at a time.")
-						return
-					}
-
-					stmt := stmts.GetStmts()[0]
-
-					// Handle SELECTs here
-					s := stmt.GetStmt().GetSelectStmt()
-					if s != nil {
-						pe := newPgEngine(db)
-						res, err := pe.executeSelect(s)
-						if err != nil {
-							log.Println(err)
-							return
-						}
-
-						writePgResult(res, conn)
-						continue
-					}
-
-					// Otherwise it's DDL/DML, raftify
-					future := r.Apply([]byte(t.String), 500*time.Millisecond)
-					if err := future.Error(); err != nil {
-						log.Printf("Could not apply: %s", err)
-						return
-					}
-
-					e := future.Response()
-					if e != nil {
-						log.Printf("Could not apply (internal): %s", e)
-						return
-					}
-
-					cmdTag := strings.ToUpper(strings.Split(t.String, " ")[0]) + " ok"
-					buf := (&pgproto3.CommandComplete{CommandTag: []byte(cmdTag)}).Encode(nil)
-					buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
-					_, err = conn.Write(buf)
-					if err != nil {
-						log.Printf("Failed to write query response: %s", err)
-					}
-				case *pgproto3.Terminate:
-					return
-				default:
-					log.Printf("Received message other than Query from client: %s\n", msg)
-					return
-				}
-			}
-		}()
+		pc := pgConn{conn, db, r}
+		go pc.handle()
 	}
 }
 
@@ -578,7 +592,7 @@ func main() {
 	}
 
 	hs := httpServer{r}
-	http.HandleFunc("/join", hs.joinHandler)
+	http.HandleFunc("/add-follower", hs.addFollowerHandler)
 	go func() {
 		err := http.ListenAndServe(":"+cfg.httpPort, nil)
 		if err != nil {
