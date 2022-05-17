@@ -488,6 +488,13 @@ func runPgServer(port string, db *bolt.DB, r *raft.Raft) {
 						log.Printf("Could not apply (internal): %s", e)
 						return
 					}
+
+					buf := (&pgproto3.CommandComplete{}).Encode(nil)
+					buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
+					_, err = conn.Write(buf)
+					if err != nil {
+						log.Printf("Failed to write query response: %s", err)
+					}
 				case *pgproto3.Terminate:
 					return
 				default:
