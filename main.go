@@ -22,7 +22,12 @@ import (
 )
 
 type pgEngine struct {
-	db *bolt.DB
+	db         *bolt.DB
+	bucketName []byte
+}
+
+func newPgEngine(db *bolt.DB) *pgEngine {
+	return &pgEngine{db, []byte("data")}
 }
 
 type pgResult struct {
@@ -37,7 +42,7 @@ type tableDefinition struct {
 	ColumnTypes []string
 }
 
-func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) (*pgResult, error) {
+func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) error {
 	tbl := tableDefinition{}
 	tbl.Name = stmt.Relation.Relname
 
@@ -59,11 +64,11 @@ func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) (*pgResult, error) {
 
 	tableBytes, err := json.Marshal(tbl)
 	if err != nil {
-		return nil, fmt.Errorf("Could not marshal table: %s", err)
+		return fmt.Errorf("Could not marshal table: %s", err)
 	}
 
 	err = pe.db.Update(func(tx *bolt.Tx) error {
-		bkt, err := tx.CreateBucketIfNotExists([]byte("data"))
+		bkt, err := tx.CreateBucketIfNotExists(pe.bucketName)
 		if err != nil {
 			return err
 		}
@@ -72,17 +77,17 @@ func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) (*pgResult, error) {
 	})
 
 	if err != nil {
-		return nil, fmt.Errorf("Could not set key-value: %s", err)
+		return fmt.Errorf("Could not set key-value: %s", err)
 	}
 
-	return nil, nil
+	return nil
 }
 
 func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
 	var tbl tableDefinition
 
 	err := pe.db.View(func(tx *bolt.Tx) error {
-		bkt := tx.Bucket([]byte("data"))
+		bkt := tx.Bucket(pe.bucketName)
 		if bkt == nil {
 			return fmt.Errorf("Table does not exist")
 		}
@@ -99,7 +104,7 @@ func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
 	return &tbl, err
 }
 
-func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) (*pgResult, error) {
+func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) error {
 	tblName := stmt.Relation.Relname
 
 	slct := stmt.GetSelectStmt().GetSelectStmt()
@@ -118,17 +123,17 @@ func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) (*pgResult, error) {
 				}
 			}
 
-			return nil, fmt.Errorf("Unknown value type: %s", value)
+			return fmt.Errorf("Unknown value type: %s", value)
 		}
 
 		rowBytes, err := json.Marshal(rowData)
 		if err != nil {
-			return nil, fmt.Errorf("Could not marshal row: %s", err)
+			return fmt.Errorf("Could not marshal row: %s", err)
 		}
 
 		id := uuid.New().String()
 		err = pe.db.Update(func(tx *bolt.Tx) error {
-			bkt, err := tx.CreateBucketIfNotExists([]byte("data"))
+			bkt, err := tx.CreateBucketIfNotExists(pe.bucketName)
 			if err != nil {
 				return err
 			}
@@ -136,11 +141,11 @@ func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) (*pgResult, error) {
 			return bkt.Put([]byte("rows_"+tblName+"_"+id), rowBytes)
 		})
 		if err != nil {
-			return nil, fmt.Errorf("Could not store row: %s", err)
+			return fmt.Errorf("Could not store row: %s", err)
 		}
 	}
 
-	return nil, nil
+	return nil
 }
 
 func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
@@ -171,7 +176,7 @@ func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 
 	prefix := []byte("rows_" + tblName + "_")
 	pe.db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket([]byte("data")).Cursor()
+		c := tx.Bucket(pe.bucketName).Cursor()
 
 		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
 			var row []any
@@ -198,53 +203,60 @@ func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 	return results, nil
 }
 
-func (pe *pgEngine) executeStatement(n *pgquery.Node) (*pgResult, error) {
-	if c := n.GetCreateStmt(); c != nil {
-		return pe.executeCreate(c)
+func (pe *pgEngine) execute(tree *pgquery.ParseResult) error {
+	for _, stmt := range tree.GetStmts() {
+		n := stmt.GetStmt()
+		if c := n.GetCreateStmt(); c != nil {
+			return pe.executeCreate(c)
+		}
+
+		if c := n.GetInsertStmt(); c != nil {
+			return pe.executeInsert(c)
+		}
+
+		if c := n.GetSelectStmt(); c != nil {
+			_, err := pe.executeSelect(c)
+			return err
+		}
+
+		return fmt.Errorf("Unknown statement type: %s", stmt)
 	}
 
-	if c := n.GetInsertStmt(); c != nil {
-		return pe.executeInsert(c)
-	}
-
-	if c := n.GetSelectStmt(); c != nil {
-		return pe.executeSelect(c)
-	}
-
-	return nil, fmt.Errorf("Unknown statement type: %s", n)
+	return nil
 }
 
-func (pe *pgEngine) execute(tree *pgquery.ParseResult) (*pgResult, error) {
-	var res *pgResult
-	var err error
-	for _, stmt := range tree.GetStmts() {
-		res, err = pe.executeStatement(stmt.GetStmt())
-		if err != nil {
-			return nil, err
+func (pe *pgEngine) delete() error {
+	return pe.db.Update(func(tx *bolt.Tx) error {
+		bkt := tx.Bucket(pe.bucketName)
+		if bkt != nil {
+			return tx.DeleteBucket(pe.bucketName)
 		}
-	}
 
-	return res, nil
+		return nil
+	})
 }
 
 type pgFsm struct {
-	pe *pgEngine
+	pe      *pgEngine
+	queries []string
 }
 
 func (pf *pgFsm) Apply(log *raft.Log) any {
 	switch log.Type {
 	case raft.LogCommand:
-		ast, err := pgquery.Parse(string(log.Data))
+		query := string(log.Data)
+		pf.queries = append(pf.queries, query)
+		ast, err := pgquery.Parse(query)
 		if err != nil {
-			return fmt.Errorf("Could not parse payload: %s", err)
+			panic(fmt.Errorf("Could not parse payload: %s", err))
 		}
 
-		_, err = pf.pe.execute(ast)
+		err = pf.pe.execute(ast)
 		if err != nil {
-			return err
+			panic(err)
 		}
 	default:
-		return fmt.Errorf("Unknown raft log type: %#v", log.Type)
+		panic(fmt.Errorf("Unknown raft log type: %#v", log.Type))
 	}
 
 	return nil
@@ -252,38 +264,18 @@ func (pf *pgFsm) Apply(log *raft.Log) any {
 
 type snapshotNoop struct{}
 
-func (sn snapshotNoop) Persist(_ raft.SnapshotSink) error { return nil }
-func (sn snapshotNoop) Release()                          {}
+func (sn snapshotNoop) Persist(sink raft.SnapshotSink) error {
+	return sink.Cancel()
+}
+
+func (sn snapshotNoop) Release() {}
 
 func (pf *pgFsm) Snapshot() (raft.FSMSnapshot, error) {
 	return snapshotNoop{}, nil
 }
 
 func (pf *pgFsm) Restore(rc io.ReadCloser) error {
-	// deleting first isn't really necessary since there's no exposed DELETE operation anyway.
-	// so any changes over time will just get naturally overwritten
-
-	decoder := json.NewDecoder(rc)
-
-	for decoder.More() {
-		var sp string
-		err := decoder.Decode(&sp)
-		if err != nil {
-			return fmt.Errorf("Could not decode payload: %s", err)
-		}
-
-		ast, err := pgquery.Parse(sp)
-		if err != nil {
-			return fmt.Errorf("Could not parse payload: %s", err)
-		}
-
-		_, err = pf.pe.execute(ast)
-		if err != nil {
-			return err
-		}
-	}
-
-	return rc.Close()
+	return fmt.Errorf("Nothing to restore")
 }
 
 func setupRaft(dir, nodeId, raftAddress string, pf *pgFsm) (*raft.Raft, error) {
@@ -466,7 +458,7 @@ func runPgServer(port string, db *bolt.DB, r *raft.Raft) {
 					// Handle SELECTs here
 					s := stmt.GetStmt().GetSelectStmt()
 					if s != nil {
-						pe := &pgEngine{db}
+						pe := newPgEngine(db)
 						res, err := pe.executeSelect(s)
 						if err != nil {
 							log.Println(err)
@@ -577,8 +569,10 @@ func main() {
 	}
 	defer db.Close()
 
-	pe := &pgEngine{db}
-	pf := &pgFsm{pe}
+	pe := newPgEngine(db)
+	// Start off in clean state
+	pe.delete()
+	pf := &pgFsm{pe, nil}
 
 	r, err := setupRaft(path.Join(dataDir, "raft"+cfg.id), cfg.id, "localhost:"+cfg.raftPort, pf)
 	if err != nil {

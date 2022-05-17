@@ -45,7 +45,7 @@ Now exit `psql` and connect to the other database at port 6001. It
 will fail if you try to write to it but SELECTs will work:
 
 ```bash
-psql -h 127.0.0.1 -p 6001
+$ psql -h 127.0.0.1 -p 6001
 psql (13.4, server 0.0.0)
 Type "help" for help.
 
@@ -59,6 +59,7 @@ phil=> select age, name from x;
 
 ## References
 
+* [Philip O'Toole on rqlite](https://youtu.be/rqO9PtBkiSQ?t=2332)
 * https://github.com/eatonphil/raft-example
 * https://yusufs.medium.com/creating-distributed-kv-database-by-implementing-raft-consensus-using-golang-d0884eef2e28
 * https://github.com/Jille/raft-grpc-example
