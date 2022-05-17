@@ -69,7 +69,7 @@ func main() {
 			fmt.Println("SELECT FROM", s.FromClause[0].GetRangeVar().Relname)
 			continue
 		}
-		
+
 		fmt.Println("UNKNOWN type: %s", stmt)
 	}
 }

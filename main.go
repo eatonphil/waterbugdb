@@ -1,8 +1,8 @@
 package main
 
 import (
-	"encoding/json"
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -12,12 +12,12 @@ import (
 	"path"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/hashicorp/raft"
+	"github.com/hashicorp/raft-boltdb"
 	"github.com/jackc/pgproto3/v2"
 	pgquery "github.com/pganalyze/pg_query_go/v2"
 	bolt "go.etcd.io/bbolt"
-	"github.com/hashicorp/raft"
-	"github.com/google/uuid"
-	"github.com/hashicorp/raft-boltdb"
 )
 
 type pgEngine struct {
@@ -27,16 +27,16 @@ type pgEngine struct {
 type pgResult struct {
 	fieldNames []string
 	fieldTypes []string
-	rows [][]any
+	rows       [][]any
 }
 
 type tableDefinition struct {
-	Name string
+	Name        string
 	ColumnNames []string
 	ColumnTypes []string
 }
 
-func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) (*pgResult, error){
+func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) (*pgResult, error) {
 	tbl := tableDefinition{}
 	tbl.Name = stmt.Relation.Relname
 
@@ -61,7 +61,7 @@ func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) (*pgResult, error){
 		return nil, fmt.Errorf("Could not marshal table: %s", err)
 	}
 
-	err = pe.db.Update(func (tx *bolt.Tx) error {
+	err = pe.db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket([]byte("data")).Put([]byte("tables_"+tbl.Name), tableBytes)
 	})
 
@@ -75,21 +75,20 @@ func (pe *pgEngine) executeCreate(stmt *pgquery.CreateStmt) (*pgResult, error){
 func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
 	var tbl tableDefinition
 
-	err := pe.db.View(func (tx *bolt.Tx) error {
-		valBytes := tx.Bucket([]byte("data")).Get([]byte("tables_"+name))
+	err := pe.db.View(func(tx *bolt.Tx) error {
+		valBytes := tx.Bucket([]byte("data")).Get([]byte("tables_" + name))
 		err := json.Unmarshal(valBytes, &tbl)
-		if err != nil{
+		if err != nil {
 			return fmt.Errorf("Could not unmarshal table: %s", err)
 		}
 
 		return nil
 	})
-	
 
 	return &tbl, err
 }
 
-func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) (*pgResult, error){
+func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) (*pgResult, error) {
 	tblName := stmt.Relation.Relname
 
 	slct := stmt.GetSelectStmt().GetSelectStmt()
@@ -117,8 +116,8 @@ func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) (*pgResult, error){
 		}
 
 		id := uuid.New().String()
-		err = pe.db.Update(func (tx *bolt.Tx)error {
-			return tx.Bucket([]byte("data")).Put([]byte("rows_"+tblName + "_"+id), rowBytes)
+		err = pe.db.Update(func(tx *bolt.Tx) error {
+			return tx.Bucket([]byte("data")).Put([]byte("rows_"+tblName+"_"+id), rowBytes)
 		})
 		if err != nil {
 			return nil, fmt.Errorf("Could not store row: %s", err)
@@ -128,7 +127,7 @@ func (pe *pgEngine) executeInsert(stmt *pgquery.InsertStmt) (*pgResult, error){
 	return nil, nil
 }
 
-func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error){
+func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 	tblName := stmt.FromClause[0].GetRangeVar().Relname
 	tbl, err := pe.getTableDefinition(tblName)
 	if err != nil {
@@ -154,10 +153,9 @@ func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error){
 		results.fieldTypes = append(results.fieldTypes, fieldType)
 	}
 
-	prefix := []byte("rows_"+tblName+"_")
+	prefix := []byte("rows_" + tblName + "_")
 	pe.db.View(func(tx *bolt.Tx) error {
-		// Assume bucket exists and has keys
-		c := tx.Bucket([]byte("MyBucket")).Cursor()
+		c := tx.Bucket([]byte("data")).Cursor()
 
 		for k, v := c.Seek(prefix); k != nil && bytes.HasPrefix(k, prefix); k, v = c.Next() {
 			var row []any
@@ -184,7 +182,7 @@ func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error){
 	return results, nil
 }
 
-func (pe *pgEngine) executeStatement(n *pgquery.Node) (*pgResult, error){
+func (pe *pgEngine) executeStatement(n *pgquery.Node) (*pgResult, error) {
 	if c := n.GetCreateStmt(); c != nil {
 		return pe.executeCreate(c)
 	}
@@ -318,7 +316,7 @@ func setupRaft(dir, nodeId, raftAddress string, pf *pgFsm) (*raft.Raft, error) {
 }
 
 type httpServer struct {
-	r  *raft.Raft
+	r *raft.Raft
 }
 
 func (hs httpServer) joinHandler(w http.ResponseWriter, r *http.Request) {
@@ -326,7 +324,7 @@ func (hs httpServer) joinHandler(w http.ResponseWriter, r *http.Request) {
 	followerAddr := r.URL.Query().Get("followerAddr")
 
 	if hs.r.State() != raft.Leader {
-		json.NewEncoder(w).Encode(struct{
+		json.NewEncoder(w).Encode(struct {
 			Error string `json:"error"`
 		}{
 			"Not the leader",
@@ -345,15 +343,15 @@ func (hs httpServer) joinHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 var dataTypeOIDMap = map[string]uint32{
-	"text": 25,
+	"text":            25,
 	"pg_catalog.int4": 23,
 }
 
-func writePgResult(res* pgResult, conn net.Conn) {
+func writePgResult(res *pgResult, conn net.Conn) {
 	rd := &pgproto3.RowDescription{}
 	for i, field := range res.fieldNames {
 		rd.Fields = append(rd.Fields, pgproto3.FieldDescription{
-			Name: []byte(field),
+			Name:        []byte(field),
 			DataTypeOID: dataTypeOIDMap[res.fieldTypes[i]],
 		})
 	}
@@ -382,7 +380,7 @@ func writePgResult(res* pgResult, conn net.Conn) {
 }
 
 func runPgServer(port string, db *bolt.DB, r *raft.Raft) {
-	ln, err := net.Listen("tcp", "localhost:" + port)
+	ln, err := net.Listen("tcp", "localhost:"+port)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -460,7 +458,7 @@ type config struct {
 	id       string
 	httpPort string
 	raftPort string
-	pgPort string
+	pgPort   string
 }
 
 func getConfig() config {
@@ -528,14 +526,14 @@ func main() {
 	pe := &pgEngine{db}
 	pf := &pgFsm{pe}
 
-	r, err := setupRaft(path.Join(dataDir, "raft"+cfg.id), cfg.id, "localhost:" + cfg.raftPort, pf)
+	r, err := setupRaft(path.Join(dataDir, "raft"+cfg.id), cfg.id, "localhost:"+cfg.raftPort, pf)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	hs := httpServer{r}
 	http.HandleFunc("/join", hs.joinHandler)
-	go func () {
+	go func() {
 		err := http.ListenAndServe(":"+cfg.httpPort, nil)
 		if err != nil {
 			log.Fatal(err)
