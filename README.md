@@ -28,7 +28,33 @@ psql -h 127.0.0.1 -p 6000
 psql (13.4, server 0.0.0)
 Type "help" for help.
 
-phil=>
+phil=> create table x (age int, name text);
+CREATE ok
+phil=> insert into x values(14, 'garry'), (20, 'ted');
+could not interpret result from server: INSERT ok
+INSERT ok
+phil=> select name, age from x;
+  name   | age 
+---------+-----
+ "garry" |  14
+ "ted"   |  20
+(2 rows)
+```
+
+Now exit `psql` and connect to the other database at port 6001. It
+will fail if you try to write to it but SELECTs will work:
+
+```bash
+psql -h 127.0.0.1 -p 6001
+psql (13.4, server 0.0.0)
+Type "help" for help.
+
+phil=> select age, name from x;
+ age |  name
+-----+---------
+  20 | "ted"
+  14 | "garry"
+(2 rows)
 ```
 
 ## References

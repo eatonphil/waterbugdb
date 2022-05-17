@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -81,13 +82,13 @@ func (pe *pgEngine) getTableDefinition(name string) (*tableDefinition, error) {
 	var tbl tableDefinition
 
 	err := pe.db.View(func(tx *bolt.Tx) error {
-		bkt, err := tx.CreateBucketIfNotExists([]byte("data"))
-		if err != nil {
-			return err
+		bkt := tx.Bucket([]byte("data"))
+		if bkt == nil {
+			return fmt.Errorf("Table does not exist")
 		}
 
 		valBytes := bkt.Get([]byte("tables_" + name))
-		err = json.Unmarshal(valBytes, &tbl)
+		err := json.Unmarshal(valBytes, &tbl)
 		if err != nil {
 			return fmt.Errorf("Could not unmarshal table: %s", err)
 		}
@@ -149,7 +150,7 @@ func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 		return nil, err
 	}
 
-	var results *pgResult
+	results := &pgResult{}
 	for _, c := range stmt.TargetList {
 		fieldName := c.GetResTarget().Val.GetColumnRef().Fields[0].GetString_().Str
 		results.fieldNames = append(results.fieldNames, fieldName)
@@ -180,8 +181,8 @@ func (pe *pgEngine) executeSelect(stmt *pgquery.SelectStmt) (*pgResult, error) {
 			}
 
 			var targetRow []any
-			for i, field := range tbl.ColumnNames {
-				for _, target := range results.fieldNames {
+			for _, target := range results.fieldNames {
+				for i, field := range tbl.ColumnNames {
 					if target == field {
 						targetRow = append(targetRow, row[i])
 					}
@@ -489,7 +490,8 @@ func runPgServer(port string, db *bolt.DB, r *raft.Raft) {
 						return
 					}
 
-					buf := (&pgproto3.CommandComplete{}).Encode(nil)
+					cmdTag := strings.ToUpper(strings.Split(t.String, " ")[0]) + " ok"
+					buf := (&pgproto3.CommandComplete{CommandTag: []byte(cmdTag)}).Encode(nil)
 					buf = (&pgproto3.ReadyForQuery{TxStatus: 'I'}).Encode(buf)
 					_, err = conn.Write(buf)
 					if err != nil {
